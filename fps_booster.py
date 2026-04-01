@@ -6,6 +6,7 @@ import subprocess
 import threading
 import psutil
 import winreg
+import customtkinter as ctk
 
 class AdminPrivilegeHandler:
     @staticmethod
@@ -73,7 +74,7 @@ class SystemOptimizer:
 class HardwareOptimizer:
     def __init__(self):
         self.original_power_plan = None
-        self.game_pids = []
+        self.currently_boosted_pid = None
 
     def set_power_plan(self, plan_guid="e9a42b02-d5df-448d-aa00-03f14749eb61"):
         try:
@@ -93,24 +94,20 @@ class HardwareOptimizer:
             except Exception:
                 pass
 
-    def optimize_cpu(self, game_name):
-        cores = os.cpu_count() or 4
-        game_cores = list(range(max(1, cores - 2)))
-        bg_cores = list(range(max(1, cores - 2), cores))
-
-        for proc in psutil.process_iter(['name', 'pid']):
-            try:
-                if proc.info['name'] and proc.info['name'].lower() == game_name.lower():
-                    p = psutil.Process(proc.info['pid'])
-                    p.nice(psutil.HIGH_PRIORITY_CLASS)
-                    p.cpu_affinity(game_cores)
-                    if p.pid not in self.game_pids:
-                        self.game_pids.append(p.pid)
-                elif proc.info['name'] and proc.info['name'].lower() not in ["system", "idle", "registry", "smss.exe"]:
-                    p = psutil.Process(proc.info['pid'])
-                    p.cpu_affinity(bg_cores)
-            except Exception:
-                pass
+    def optimize_cpu_dynamic(self, active_pid):
+        try:
+            if self.currently_boosted_pid and self.currently_boosted_pid != active_pid:
+                try:
+                    old_p = psutil.Process(self.currently_boosted_pid)
+                    old_p.nice(psutil.NORMAL_PRIORITY_CLASS)
+                except Exception:
+                    pass
+            if active_pid:
+                new_p = psutil.Process(active_pid)
+                new_p.nice(psutil.HIGH_PRIORITY_CLASS)
+                self.currently_boosted_pid = active_pid
+        except Exception:
+            pass
 
     def revert(self):
         if self.original_power_plan:
@@ -119,17 +116,13 @@ class HardwareOptimizer:
             except Exception:
                 pass
         self.trigger_msi_afterburner(2)
-        
-        cores = list(range(os.cpu_count() or 4))
-        for proc in psutil.process_iter(['pid', 'name']):
+        if self.currently_boosted_pid:
             try:
-                p = psutil.Process(proc.info['pid'])
-                p.cpu_affinity(cores)
-                if p.pid in self.game_pids:
-                    p.nice(psutil.NORMAL_PRIORITY_CLASS)
+                p = psutil.Process(self.currently_boosted_pid)
+                p.nice(psutil.NORMAL_PRIORITY_CLASS)
             except Exception:
                 pass
-        self.game_pids.clear()
+        self.currently_boosted_pid = None
 
 class NetworkAndLatencyManager:
     def __init__(self):
@@ -205,60 +198,171 @@ class NetworkAndLatencyManager:
                 pass
         self.modified_interfaces.clear()
 
-class AutoTriggerDaemon:
-    def __init__(self, target_game):
-        self.target_game = target_game
+class DynamicForegroundTracker:
+    def __init__(self, log_callback=lambda x: None):
         self.sys_opt = SystemOptimizer()
         self.hw_opt = HardwareOptimizer()
         self.net_opt = NetworkAndLatencyManager()
         self.is_boosted = False
+        self.log = log_callback
+        self.stop_event = threading.Event()
+        self.active_process_name = "None"
 
-    def is_game_running(self):
-        for proc in psutil.process_iter(['name']):
-            try:
-                if proc.info['name'] and proc.info['name'].lower() == self.target_game.lower():
-                    return True
-            except Exception:
-                pass
-        return False
+    def get_foreground_process(self):
+        try:
+            hwnd = ctypes.windll.user32.GetForegroundWindow()
+            if hwnd:
+                pid = ctypes.c_ulong()
+                ctypes.windll.user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+                return pid.value
+        except Exception:
+            pass
+        return None
 
-    def boost(self):
+    def toggle_boost(self):
         if not self.is_boosted:
+            self.log("Activating Global System Options...")
             self.sys_opt.terminate_background_apps()
             self.sys_opt.suspend_services()
             self.sys_opt.clear_memory_cache()
             self.sys_opt.flush_dns()
+            self.log("Applying Hardware Modifications globally...")
             self.hw_opt.set_power_plan()
             self.hw_opt.trigger_msi_afterburner(1)
+            self.log("Applying Network OS Low-Latency parameters...")
             self.net_opt.set_timer_resolution(5000)
             self.net_opt.set_tcp_no_delay()
+            self.log("GLOBAL BOOST ACTIVE")
             self.is_boosted = True
-
-    def update_cpu_affinity(self):
-        if self.is_boosted:
-            self.hw_opt.optimize_cpu(self.target_game)
-
-    def revert(self):
-        if self.is_boosted:
+        else:
+            self.log("Deactivating Global Booster...")
             self.sys_opt.revert()
             self.hw_opt.revert()
             self.net_opt.revert()
             self.is_boosted = False
+            self.active_process_name = "None"
+            self.log("System Restored")
 
-    def run(self):
-        while True:
-            running = self.is_game_running()
-            if running:
-                if not self.is_boosted:
-                    self.boost()
-                self.update_cpu_affinity()
-            else:
-                if self.is_boosted:
-                    self.revert()
-            time.sleep(5)
+    def run_loop(self):
+        while not self.stop_event.is_set():
+            if self.is_boosted:
+                active_pid = self.get_foreground_process()
+                if active_pid:
+                    try:
+                        p = psutil.Process(active_pid)
+                        name = p.name()
+                        if name.lower() not in ["system", "idle", "ui", "explorer.exe", "searchapp.exe"]:
+                            if self.hw_opt.currently_boosted_pid != active_pid:
+                                self.hw_opt.optimize_cpu_dynamic(active_pid)
+                                self.log(f"Dynamic Boost Attached -> {name} (PID: {active_pid})")
+                                self.active_process_name = name
+                    except Exception:
+                        pass
+            time.sleep(1.5)
+
+class BoosterGUI(ctk.CTk):
+    def __init__(self, tracker):
+        super().__init__()
+        self.tracker = tracker
+        self.title("Global Dynamic FPS Booster")
+        self.geometry("800x550")
+        self.resizable(False, False)
+        
+        ctk.set_appearance_mode("dark")
+        ctk.set_default_color_theme("blue")
+        
+        self.grid_columnconfigure(1, weight=1)
+        self.grid_rowconfigure(0, weight=1)
+
+        self.sidebar_frame = ctk.CTkFrame(self, width=220, corner_radius=0)
+        self.sidebar_frame.grid(row=0, column=0, sticky="nsew")
+        self.sidebar_frame.grid_rowconfigure(5, weight=1)
+        
+        self.logo_label = ctk.CTkLabel(self.sidebar_frame, text="System Booster", font=ctk.CTkFont(size=22, weight="bold"))
+        self.logo_label.grid(row=0, column=0, padx=20, pady=(30, 20))
+        
+        self.lbl_cpu = ctk.CTkLabel(self.sidebar_frame, text="CPU Usage: --%", font=ctk.CTkFont(size=14))
+        self.lbl_cpu.grid(row=1, column=0, padx=20, pady=10, sticky="w")
+        
+        self.lbl_ram = ctk.CTkLabel(self.sidebar_frame, text="RAM Used: --%", font=ctk.CTkFont(size=14))
+        self.lbl_ram.grid(row=2, column=0, padx=20, pady=10, sticky="w")
+        
+        self.lbl_status = ctk.CTkLabel(self.sidebar_frame, text="Global Status: IDLE", font=ctk.CTkFont(size=15, weight="bold"), text_color="gray")
+        self.lbl_status.grid(row=3, column=0, padx=20, pady=20, sticky="w")
+        
+        self.btn_revert = ctk.CTkButton(self.sidebar_frame, text="Revert to Normal", fg_color="transparent", border_width=2, text_color=("gray10", "#DCE4EE"), hover_color="#B22222", command=self.manual_revert)
+        self.btn_revert.grid(row=6, column=0, padx=20, pady=20)
+        
+        self.main_frame = ctk.CTkFrame(self, fg_color="transparent")
+        self.main_frame.grid(row=0, column=1, padx=20, pady=20, sticky="nsew")
+        self.main_frame.grid_columnconfigure(0, weight=1)
+        self.main_frame.grid_rowconfigure(2, weight=1)
+        
+        self.lbl_header = ctk.CTkLabel(self.main_frame, text="Currently Accelerated Program", font=ctk.CTkFont(size=18, weight="bold"))
+        self.lbl_header.grid(row=0, column=0, sticky="w", pady=(0, 10))
+        
+        self.lbl_active_window = ctk.CTkLabel(self.main_frame, text="None (Waiting for Boost...)", font=ctk.CTkFont(size=20, weight="bold"), text_color="#3498db")
+        self.lbl_active_window.grid(row=1, column=0, sticky="w", pady=(0, 20))
+        
+        self.log_textbox = ctk.CTkTextbox(self.main_frame, font=ctk.CTkFont(family="Consolas", size=13))
+        self.log_textbox.grid(row=2, column=0, sticky="nsew", pady=(0, 20))
+        self.log_textbox.configure(state="disabled")
+        
+        self.btn_force_boost = ctk.CTkButton(self.main_frame, text="⚡ ACTIVATE GLOBAL BOOST", height=60, font=ctk.CTkFont(size=16, weight="bold"), command=self.manual_boost)
+        self.btn_force_boost.grid(row=3, column=0, sticky="ew")
+
+        self.tracker.log = self.append_log
+        self.append_log("System Ready. Click Activate to grant Dynamic Powers.")
+        self.update_stats()
+
+    def manual_boost(self):
+        if not self.tracker.is_boosted:
+            self.tracker.toggle_boost()
+            self.btn_force_boost.configure(text="⚡ DEACTIVATE BOOST", fg_color="#e74c3c", hover_color="#c0392b")
+        else:
+            self.tracker.toggle_boost()
+            self.btn_force_boost.configure(text="⚡ ACTIVATE GLOBAL BOOST", fg_color=["#3a7ebf", "#1f538d"], hover_color=["#325882", "#14375e"])
+
+    def manual_revert(self):
+        if self.tracker.is_boosted:
+            self.manual_boost()
+
+    def append_log(self, text):
+        self.log_textbox.configure(state="normal")
+        ts = time.strftime("%H:%M:%S")
+        self.log_textbox.insert("end", f"[{ts}] {text}\n")
+        self.log_textbox.see("end")
+        self.log_textbox.configure(state="disabled")
+
+    def update_stats(self):
+        cpu = psutil.cpu_percent(interval=None)
+        mem = psutil.virtual_memory()
+        self.lbl_cpu.configure(text=f"CPU Usage: {cpu:.1f}%")
+        self.lbl_ram.configure(text=f"RAM Used: {mem.percent:.1f}%")
+        
+        if self.tracker.is_boosted:
+            self.lbl_status.configure(text="Status: ACTIVE", text_color="#3498db")
+            if self.tracker.active_process_name:
+                self.lbl_active_window.configure(text=self.tracker.active_process_name)
+        else:
+            self.lbl_status.configure(text="Status: IDLE", text_color="gray")
+            self.lbl_active_window.configure(text="None (Waiting for Boost...)")
+            
+        self.after(1500, self.update_stats)
+
+    def on_closing(self):
+        self.tracker.stop_event.set()
+        if self.tracker.is_boosted:
+            self.tracker.toggle_boost()
+        self.destroy()
 
 if __name__ == "__main__":
     AdminPrivilegeHandler.ensure_admin()
-    game_exe = sys.argv[1] if len(sys.argv) > 1 else "valorant.exe"
-    daemon = AutoTriggerDaemon(game_exe)
-    daemon.run()
+    app_tracker = DynamicForegroundTracker()
+    
+    thread = threading.Thread(target=app_tracker.run_loop, daemon=True)
+    thread.start()
+    
+    gui = BoosterGUI(app_tracker)
+    gui.protocol("WM_DELETE_WINDOW", gui.on_closing)
+    gui.mainloop()
